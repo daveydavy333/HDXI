@@ -1,4 +1,5 @@
-# HDXI
+<img width="600" height="240" alt="Untitled45_20261007220815" src="https://github.com/user-attachments/assets/e61c83f2-2439-4eff-9a29-3059aa098d5b" />
+
 
 The standard for pure computing.
 
