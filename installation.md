@@ -1,8 +1,8 @@
 # installation
 
-installation is relatively simple, but it is manual. you partition a disk, unpack a tarball, and then build your own kernel and bootloader with hdx.
+installation is relatively simple, but it is manual. you partition a disk, unpack a tarball, clone the ports tree, and then build your own kernel and bootloader with hdx.
 
-the tarball contains a base system: musl, busybox, a build toolchain, the situation init, hdx, and the /hdxp ports tree. it does not contain a kernel or a bootloader. those are ports, so you choose how to build them.
+the tarball contains a base system: musl, busybox, a build toolchain, the situation init, and hdx. it does not contain the /hdxp ports tree, which you clone from github during installation (step 4). it does not contain a kernel or a bootloader either. those are ports, so you choose how to build them.
 
 this procedure has so far been tested in qemu with UEFI firmware only. real hardware may need adjustments.
 
@@ -11,7 +11,7 @@ this procedure has so far been tested in qemu with UEFI firmware only. real hard
 * any linux live system (or the HDXI installation media) with: tar, a GPT-capable partitioning tool (sfdisk, sgdisk, parted, cfdisk, or gparted), mkfs.vfat, mkfs.ext4, blkid, and chroot. live systems differ, so check what yours has: `command -v sfdisk sgdisk parted cfdisk`.
 * a UEFI machine. legacy BIOS is not supported by `base-limine` yet.
 * secure boot turned off. the bootloader is built from source and is not signed.
-* an internet connection. hdx downloads sources, and the kernel source is about 150 MB.
+* an internet connection. the ports tree is cloned from github, hdx downloads sources, and the kernel source is about 150 MB.
 * patience. building the kernel takes a while.
 
 ## 1 partition the disk
@@ -78,7 +78,19 @@ at boot, situation does not read /etc/fstab by itself. the base ships a small bo
 
 the /etc/resolv.conf you just wrote is only for the install. at boot, the dhcp service (net) rewrites it.
 
-## 4 build the kernel
+## 4 get the ports tree
+
+the tarball does not contain /hdxp. clone the ports tree into it from inside the chroot (the dns server you wrote in step 3 is what lets git reach github), then create the two folders hdx keeps its local state in. sources and install records are not part of the repository:
+
+    git clone https://github.com/daveydavy333/hdxp /hdxp
+    mkdir -p /hdxp/src /hdxp/installed
+    cp /usr/share/hdxi/installed/* /hdxp/installed/
+
+the last command restores the install records for the ports that ship in the base system (situation and pfetch), so `hdx l` lists them.
+
+if git says /hdxp already exists and is not empty, you are using an older tarball that still shipped /hdxp. in that case you can skip this step.
+
+## 5 build the kernel
 
     hdx i base-kernel
 
@@ -86,7 +98,7 @@ this downloads the linux source, verifies its checksum, configures it, and build
 
 if you want to change the kernel configuration, see the info file: `hdx info base-kernel`.
 
-## 5 install the bootloader
+## 6 install the bootloader
 
 ! the EFI system partition must be mounted at /boot first (step 2).
 
@@ -94,7 +106,7 @@ if you want to change the kernel configuration, see the info file: `hdx info bas
 
 this builds limine for UEFI and puts it at /boot/EFI/BOOT/BOOTX64.EFI.
 
-## 6 write the bootloader config
+## 7 write the bootloader config
 
 limine needs to know which kernel to start and where the root partition is. the root partition is identified by its PARTUUID, a 36 character id. do not type it by hand. one wrong character gives a kernel panic that says almost nothing: `Cannot open root device ""` with an empty name, and an empty list of partitions. let the shell fill it in.
 
