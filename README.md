@@ -3,6 +3,8 @@
 <img width="600" height="240" alt="Untitled45_20261007220815" src="https://github.com/user-attachments/assets/e61c83f2-2439-4eff-9a29-3059aa098d5b" />
 
 
+The standard for pure computing.
+
 HDXI is an independent linux distribution built for user sovereignty, transparency, and speed.
 
 HDXI stands for High Definition Computing Environment.
@@ -18,7 +20,7 @@ HDXI rejects the bloated infrastructure of mainstream operating systems. it stri
 * init: situation, a small shell init and service manager (`base-situation`). it ships with the base system.
 * bootloader: limine, installed by the `base-limine` port (UEFI only for now). a `base-grub` port is planned.
 * directory layout: all ports, sources, and install records live transparently inside a single root directory named /hdxp.
-* desktop: the dwl compositor on wlroots, the foot terminal and firefox, drawn with software rendering. they are all ports (`util-dwl`, `util-foot`, `misc-firefox`). firefox is the one exception to building from source: it is too heavy to compile here, so `misc-firefox` installs a prebuilt bundle.
+* desktop: there is no fixed desktop. you build the one you want out of ports, and the port list is still small, so right now the options are the dwl compositor on wlroots, the foot terminal and firefox, drawn with software rendering. they are all ports (`util-dwl`, `util-foot`, `misc-firefox`), and more ports are welcome (see contribute.md). firefox is the one exception to building from source: it is too heavy to compile here, so `misc-firefox` installs a prebuilt bundle.
 
 ---
 
@@ -59,18 +61,22 @@ known limit: only ports that ship an uninstall.sh clean up beyond their binaries
 
 ## status
 
-what works today, tested in qemu with UEFI firmware and on a real laptop (a lenovo ideapad slim 1):
+what works today, tested in qemu with UEFI firmware and on two real laptops (a lenovo ideapad slim 1, and an hp elitebook with nvme storage and an intel wifi card):
 
 * boot: UEFI firmware, then limine, then the HDXI kernel, then situation, then a login prompt.
-* networking: dhcp through a situation service. wifi works on the laptop's atheros card through the ports `devel-libnl`, `util-wpa_supplicant` and `misc-ath10k-firmware`.
+* dual boot: HDXI can share an EFI system partition with another OS. on the elitebook, limine shows a menu with HDXI and an existing arch linux install (chainloaded), and both boot.
+* storage: root on emmc (ideapad), nvme (elitebook) and virtio (qemu). the drivers are built into the kernel, so there is no initramfs.
+* networking: dhcp through a situation service. wifi works on both laptops through the ports `devel-libnl` and `util-wpa_supplicant`, plus a firmware port for the card: `misc-ath10k-firmware` for the ideapad's atheros, `misc-iwlwifi-firmware` for the elitebook's intel ax201. the firmware is built into the kernel, so install the firmware port before `base-kernel`.
 * boot checks: the EFI system partition (FAT) is checked at boot before it is mounted. the root filesystem relies on ext4's journal replay.
-* desktop: dwl, foot and firefox run on the laptop and in qemu. install them with `hdx i util-dwl util-foot misc-dejavu-fonts misc-firefox`; hdx builds their dependencies first.
+* desktop: dwl, foot and firefox run on the ideapad and in qemu (not tried on the elitebook yet). install them with `hdx i util-dwl util-foot misc-dejavu-fonts misc-firefox`; hdx builds their dependencies first.
 * ports: base-situation, base-kernel, base-limine, util-pfetch, plus the wifi and desktop ports above and the libraries they need. the full list is in the hdxp repository.
 
 not done yet:
 
 * BIOS (legacy) boot, and secure boot. the bootloader is built from source and unsigned.
-* hardware graphics acceleration. rendering is in software and there is no mesa port yet.
-* testing on more hardware than one laptop.
+* wifi at boot. for now wpa_supplicant is started by hand or from a login script.
+* hardware graphics acceleration. rendering is in software and there is no mesa port yet. the elitebook has no intel graphics driver enabled yet and runs on the efi framebuffer for now.
+* the ideapad's built-in touchpad (not tried on the elitebook yet). it needs more kernel options. usb mice work, but dwl only sees devices that are plugged in before it starts, because there is no udev daemon.
+* testing on more hardware than two laptops.
 
 see installation.md to install, packages.md to use ports, and contribute.md to write one.
