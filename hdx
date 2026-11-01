@@ -1,0 +1,371 @@
+#!/bin/sh
+# hdx - high definition execution
+# the HDXP port manager for HDXI.
+#
+# usage:
+#   hdx i [-f] <class-pkg>   install a port (and its deps, recursively)
+#   hdx r [-f] <class-pkg>   remove a port (its binaries, plus its uninstall.sh if it has one)
+#   hdx l                    list installed ports
+#   hdx info <class-pkg>     show a port's info file
+#   hdx u                    update the ports tree (git pull). clones it first if missing
+#   hdx u i [-f] <class-pkg> update the tree, then install   (shorthand: hdx ui ...)
+#   hdx help
+#
+# -f on install: rebuild even if the port is already installed.
+# -f on remove:  allow removing protected ports (class base-).
+#
+# env:
+#   HDXP         root of the ports tree (default /hdxp). set this to a
+#                scratch dir to test without touching the real system.
+#   HDX_BINDIRS  dirs searched on removal (default "/bin /usr/bin /usr/local/bin")
+#   HDXP_URL     git url of the ports tree (default the official hdxp repo)
+#   HDX_MARKERS  base port install markers restored on a fresh clone
+#                (default /usr/share/hdxi/installed)
+
+HDXP="${HDXP:-/hdxp}"
+PKGS="$HDXP/pkgs"
+SRC="$HDXP/src"
+STATE="$HDXP/installed"
+BINDIRS="${HDX_BINDIRS:-/bin /usr/bin /usr/local/bin}"
+HDXP_URL="${HDXP_URL:-https://github.com/daveydavy333/hdxp}"
+MARKERS="${HDX_MARKERS:-/usr/share/hdxi/installed}"
+
+STACK=""   # ports currently being installed, for cycle detection
+FORCE=0
+
+# ---------- helpers ----------
+
+msg() { printf 'hdx: %s\n' "$*"; }
+die() { printf 'hdx: error: %s\n' "$*" >&2; exit 1; }
+
+# class-name only: lowercase letters, digits, one dash between class and name.
+# also blocks slashes and dots so a name can never escape /hdxp/pkgs.
+valid_name() {
+    case "$1" in
+        ''|*[!a-z0-9_-]*|-*|*-) return 1 ;;
+        *-*) return 0 ;;
+        *)   return 1 ;;
+    esac
+}
+
+# util-pfetch -> pfetch
+primary_name() { printf '%s\n' "${1#*-}"; }
+
+# protected ports: the base class (init, bootloader, ...)
+is_protected() {
+    case "$1" in base-*) return 0 ;; *) return 1 ;; esac
+}
+
+# read a one-name-per-line file, ignoring blanks, comments, CRLF, whitespace
+read_list() {
+    [ -f "$1" ] || return 0
+    sed 's/\r$//; s/#.*//; s/^[[:space:]]*//; s/[[:space:]]*$//' "$1" | grep -v '^$'
+}
+
+# multibin file: accepts .multibin (contribute.md) or .multbin (hdxi.md)
+multibin_file() {
+    for f in "$PKGS/$1/.multibin" "$PKGS/$1/.multbin"; do
+        [ -f "$f" ] && { printf '%s\n' "$f"; return 0; }
+    done
+    return 1
+}
+
+is_installed() { [ -f "$STATE/$1" ]; }
+
+# a dependency counts as satisfied if hdx installed it, or if its binary
+# already exists on PATH (covers tools shipped in the base tarball)
+have_dep() {
+    is_installed "$1" && return 0
+    command -v "$(primary_name "$1")" >/dev/null 2>&1
+}
+
+# privilege helper for deleting from system dirs
+as_root() {
+    if [ "$(id -u)" -eq 0 ]; then "$@"
+    elif command -v doas >/dev/null 2>&1; then doas "$@"
+    elif command -v sudo >/dev/null 2>&1; then sudo "$@"
+    else die "need root to run: $*"
+    fi
+}
+
+confirm() {
+    printf '%s [y/N] ' "$1"
+    read -r ans
+    case "$ans" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+# true if the path is (a link to) busybox itself. never delete those.
+is_busybox() {
+    [ -L "$1" ] || return 1
+    case "$(readlink -f "$1" 2>/dev/null)" in */busybox*) return 0 ;; esac
+    return 1
+}
+
+# ---------- install ----------
+
+install_pkg() {
+    local pkg="$1" dir deps d old_stack
+
+    valid_name "$pkg" || die "invalid port name '$pkg' (expected class-name, eg. util-pfetch)"
+    dir="$PKGS/$pkg"
+    [ -d "$dir" ]          || die "no such port: $pkg (looked in $PKGS)"
+    [ -f "$dir/make.sh" ]  || die "port $pkg has no make.sh"
+
+    # cycle detection
+    case " $STACK " in
+        *" $pkg "*) die "dependency cycle: $STACK $pkg" ;;
+    esac
+    old_stack="$STACK"
+    STACK="${STACK:+$STACK }$pkg"
+
+    # dependencies first. collect into a variable before looping so that
+    # nested make.sh scripts can never swallow the deps file from stdin.
+    deps="$(read_list "$dir/deps")"
+    for d in $deps; do
+        if have_dep "$d"; then
+            msg "dependency $d: ok"
+        else
+            msg "dependency $d: building first"
+            install_pkg "$d"
+        fi
+    done
+
+    msg "building $pkg"
+    mkdir -p "$SRC" || die "cannot create $SRC"
+    export HDXP HDX_PKG="$pkg" HDX_SRC="$SRC/$pkg-src"
+
+    # -e: any failing command in make.sh aborts the build
+    if ! ( cd "$dir" && sh -e ./make.sh ); then
+        die "build of $pkg failed. source left in $SRC/$pkg-src for debugging."
+    fi
+
+    # only mark as installed after a clean build
+    mkdir -p "$STATE" || die "cannot create $STATE"
+    date > "$STATE/$pkg" || die "cannot write marker for $pkg"
+    msg "installed $pkg"
+
+    STACK="$old_stack"
+}
+
+# entry point for "hdx i": skip targets that are already installed unless -f
+install_target() {
+    if is_installed "$1" && [ "$FORCE" -eq 0 ]; then
+        msg "$1 is already installed (use -f to rebuild)"
+        return 0
+    fi
+    install_pkg "$1"
+}
+
+# ---------- remove ----------
+
+remove_pkg() {
+    local pkg="$1" name names found dir f other script
+
+    valid_name "$pkg" || die "invalid port name '$pkg'"
+
+    if is_protected "$pkg" && [ "$FORCE" -eq 0 ]; then
+        die "$pkg is a protected base port (init, bootloader, ...). removing it can make the system unbootable. use: hdx r -f $pkg"
+    fi
+    is_installed "$pkg" || msg "note: $pkg has no install marker, searching anyway"
+
+    # warn if something else depends on this port
+    if [ -d "$STATE" ]; then
+        for f in "$STATE"/*; do
+            [ -f "$f" ] || continue
+            other="${f##*/}"
+            [ "$other" = "$pkg" ] && continue
+            if read_list "$PKGS/$other/deps" | grep -qx "$pkg"; then
+                msg "warning: installed port $other depends on $pkg"
+            fi
+        done
+    fi
+
+    # names to hunt for: primary name + anything in .multibin
+    names="$(primary_name "$pkg")"
+    if f="$(multibin_file "$pkg")"; then
+        names="$names $(read_list "$f")"
+    fi
+
+    found=""
+    for name in $names; do
+        for dir in $BINDIRS; do
+            [ -f "$dir/$name" ] || continue
+            if is_busybox "$dir/$name"; then
+                msg "skipping $dir/$name (busybox applet)"
+                continue
+            fi
+            found="$found $dir/$name"
+        done
+    done
+
+    # optional uninstall.sh: removes everything else the port installed
+    script="$PKGS/$pkg/uninstall.sh"
+    [ -f "$script" ] || script=""
+
+    if [ -z "$found" ] && [ -z "$script" ]; then
+        msg "no binaries found for $pkg (library port?)"
+        confirm "drop install marker for $pkg?" || { msg "aborted"; return 1; }
+        rm -f "$STATE/$pkg"
+        return 0
+    fi
+
+    if [ -n "$found" ]; then
+        msg "will delete:"
+        for f in $found; do printf '  %s\n' "$f"; done
+    fi
+    if [ -n "$script" ]; then
+        msg "will run this uninstall script as root:"
+        sed 's/^/    /' "$script"
+    fi
+    if is_protected "$pkg"; then
+        msg "WARNING: $pkg is a base port. this may leave the system unbootable."
+    fi
+    confirm "remove $pkg?" || { msg "aborted"; return 1; }
+
+    # script first: if it fails, nothing else has been touched yet
+    if [ -n "$script" ]; then
+        if ! ( cd "$PKGS/$pkg" && as_root env HDXP="$HDXP" HDX_PKG="$pkg" sh -e ./uninstall.sh ); then
+            die "uninstall script for $pkg failed. binaries were not removed and $pkg is still marked installed."
+        fi
+    fi
+    for f in $found; do as_root rm -f -- "$f"; done
+    rm -f "$STATE/$pkg"
+    msg "removed $pkg"
+}
+
+# ---------- update ----------
+
+# src/ and installed/ are not in the git repo, so make sure they exist
+ensure_dirs() {
+    mkdir -p "$SRC" "$STATE" || die "cannot create $SRC and $STATE"
+}
+
+# on a fresh clone, restore the install markers of the base ports that
+# came with the tarball, without overwriting any marker already there
+restore_markers() {
+    local f
+    [ -d "$MARKERS" ] || return 0
+    for f in "$MARKERS"/*; do
+        [ -f "$f" ] || continue
+        [ -e "$STATE/${f##*/}" ] || cp "$f" "$STATE/"
+    done
+}
+
+update_tree() {
+    local old new changed p hit
+
+    command -v git >/dev/null 2>&1 || die "git not found, cannot update the ports tree"
+
+    if [ ! -d "$HDXP/.git" ]; then
+        if [ -e "$HDXP" ] && [ -n "$(ls -A "$HDXP" 2>/dev/null)" ]; then
+            die "$HDXP exists but is not a git clone. move it aside (mv $HDXP $HDXP.old), run hdx u again, then move src and installed back"
+        fi
+        msg "no ports tree at $HDXP, cloning $HDXP_URL"
+        git clone "$HDXP_URL" "$HDXP" || die "clone failed"
+        ensure_dirs
+        restore_markers
+        msg "ports tree ready"
+        return 0
+    fi
+
+    old="$(git -C "$HDXP" rev-parse HEAD 2>/dev/null)" || die "$HDXP is a broken git clone"
+    msg "updating ports tree"
+    git -C "$HDXP" pull --ff-only \
+        || die "update failed. local changes or diverged history in $HDXP? (see: git -C $HDXP status)"
+    ensure_dirs
+    new="$(git -C "$HDXP" rev-parse HEAD)"
+
+    if [ "$old" = "$new" ]; then
+        msg "ports tree is already up to date"
+        return 0
+    fi
+
+    # ports whose files changed in this update
+    changed="$(git -C "$HDXP" diff --name-only "$old" "$new" -- pkgs | cut -d/ -f2 | sort -u)"
+    hit=""
+    for p in $changed; do
+        is_installed "$p" && hit="$hit $p"
+    done
+    msg "ports tree updated"
+    if [ -n "$hit" ]; then
+        msg "installed ports with changes (rebuild with: hdx i -f <port>):"
+        for p in $hit; do printf '  %s\n' "$p"; done
+    fi
+}
+
+# ---------- misc ----------
+
+list_pkgs() {
+    [ -d "$STATE" ] || return 0
+    for f in "$STATE"/*; do
+        [ -f "$f" ] && printf '%s\n' "${f##*/}"
+    done
+}
+
+show_info() {
+    local pkg="$1" f shown=0
+    valid_name "$pkg" || die "invalid port name '$pkg'"
+    [ -d "$PKGS/$pkg" ] || die "no such port: $pkg"
+    for f in "$PKGS/$pkg"/info*; do
+        [ -f "$f" ] && { cat "$f"; shown=1; }
+    done
+    [ "$shown" -eq 1 ] || msg "$pkg has no info file"
+}
+
+usage() {
+    cat <<USAGE
+hdx - high definition execution
+
+  hdx i [-f] <class-pkg>   install a port and its dependencies
+                           (-f: rebuild if already installed)
+  hdx r [-f] <class-pkg>   remove a port
+                           (-f: allow removing protected base- ports)
+  hdx l                    list installed ports
+  hdx info <class-pkg>     show port info
+  hdx u                    update the ports tree (git pull);
+                           clones it first if it is missing
+  hdx u i [-f] <class-pkg> update the tree, then install
+                           (shorthand: hdx ui [-f] <class-pkg>)
+  hdx help                 this text
+
+ports tree: $PKGS
+USAGE
+}
+
+# ---------- main ----------
+
+cmd="$1"
+[ $# -gt 0 ] && shift
+
+# optional -f flag after the command
+if [ "$1" = "-f" ]; then
+    FORCE=1
+    shift
+fi
+
+case "$cmd" in
+    i|install) [ $# -ge 1 ] || die "usage: hdx i [-f] <class-pkg>"
+               for p in "$@"; do install_target "$p"; done ;;
+    r|remove)  [ $# -ge 1 ] || die "usage: hdx r [-f] <class-pkg>"
+               for p in "$@"; do remove_pkg "$p"; done ;;
+    u|update)  if [ $# -gt 0 ]; then
+                   case "$1" in
+                       i|install) shift ;;
+                       *) die "usage: hdx u [i [-f] <class-pkg>]" ;;
+                   esac
+                   if [ "$1" = "-f" ]; then FORCE=1; shift; fi
+                   [ $# -ge 1 ] || die "usage: hdx u i [-f] <class-pkg>"
+                   update_tree
+                   for p in "$@"; do install_target "$p"; done
+               else
+                   update_tree
+               fi ;;
+    ui)        [ $# -ge 1 ] || die "usage: hdx ui [-f] <class-pkg>"
+               update_tree
+               for p in "$@"; do install_target "$p"; done ;;
+    l|list)    list_pkgs ;;
+    info)      [ $# -ge 1 ] || die "usage: hdx info <class-pkg>"
+               show_info "$1" ;;
+    ''|help|-h|--help) usage ;;
+    *)         usage >&2; exit 1 ;;
+esac
