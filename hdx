@@ -139,9 +139,14 @@ install_pkg() {
         die "build of $pkg failed. source left in $SRC/$pkg-src for debugging."
     fi
 
+    # flush to disk before marking it installed, so a crash or a killed vm
+    # cannot leave a marker (or empty files) for an install that never hit the disk
+    sync
+
     # only mark as installed after a clean build
     mkdir -p "$STATE" || die "cannot create $STATE"
     date > "$STATE/$pkg" || die "cannot write marker for $pkg"
+    sync
     msg "installed $pkg"
 
     STACK="$old_stack"
@@ -264,6 +269,7 @@ update_tree() {
         git clone "$HDXP_URL" "$HDXP" || die "clone failed"
         ensure_dirs
         restore_markers
+        sync
         msg "ports tree ready"
         return 0
     fi
@@ -286,6 +292,7 @@ update_tree() {
     for p in $changed; do
         is_installed "$p" && hit="$hit $p"
     done
+    sync
     msg "ports tree updated"
     if [ -n "$hit" ]; then
         msg "installed ports with changes (rebuild with: hdx i -f <port>):"
