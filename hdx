@@ -9,7 +9,13 @@
 #   hdx info <class-pkg>     show a port's info file
 #   hdx u                    update the ports tree (git pull). clones it first if missing
 #   hdx u i [-f] <class-pkg> update the tree, then install   (shorthand: hdx ui ...)
+#   hdx skp                  clone (or update) the skunkport tree
 #   hdx help
+#
+# skunkports: extremely heavy or experimental ports live in a separate tree
+# (hdxp-skp, cloned to /hdxp/skp). use the skp/ prefix with any command:
+#   hdx i skp/devel-mesa
+# a port with a "warning" file shows it and asks before building.
 #
 # -f on install: rebuild even if the port is already installed.
 # -f on remove:  allow removing protected ports (class base-).
@@ -21,6 +27,9 @@
 #   HDXP_URL     git url of the ports tree (default the official hdxp repo)
 #   HDX_MARKERS  base port install markers restored on a fresh clone
 #                (default /usr/share/hdxi/installed)
+#   HDX_SKP      root of the skunkport tree (default $HDXP/skp)
+#   SKP_URL      git url of the skunkport tree (default the official hdxp-skp repo)
+#   HDX_YES      set to 1 to skip the "build anyway?" question for ports with a warning
 
 HDXP="${HDXP:-/hdxp}"
 PKGS="$HDXP/pkgs"
@@ -29,6 +38,8 @@ STATE="$HDXP/installed"
 BINDIRS="${HDX_BINDIRS:-/bin /usr/bin /usr/local/bin}"
 HDXP_URL="${HDXP_URL:-https://github.com/daveydavy333/hdxp}"
 MARKERS="${HDX_MARKERS:-/usr/share/hdxi/installed}"
+SKP="${HDX_SKP:-$HDXP/skp}"
+SKP_URL="${SKP_URL:-https://github.com/daveydavy333/hdxp-skp}"
 
 STACK=""   # ports currently being installed, for cycle detection
 FORCE=0
@@ -48,8 +59,52 @@ valid_name() {
     esac
 }
 
-# util-pfetch -> pfetch
-primary_name() { printf '%s\n' "${1#*-}"; }
+# skunkports. the name you type is skp/class-name. inside hdx every port has an
+# id: normal ports use class-name, skunkports use skp-class-name. markers and
+# source dirs are named after the id, so the two trees can never collide
+# (which makes "skp" a reserved class name).
+valid_port() {
+    case "$1" in
+        skp/*) valid_name "${1#skp/}" ;;
+        *)     valid_name "$1" ;;
+    esac
+}
+
+# typed name -> id
+port_id() {
+    case "$1" in
+        skp/*) printf 'skp-%s\n' "${1#skp/}" ;;
+        *)     printf '%s\n' "$1" ;;
+    esac
+}
+
+# id -> directory of the port
+port_dir() {
+    case "$1" in
+        skp-*) printf '%s/pkgs/%s\n' "$SKP" "${1#skp-}" ;;
+        *)     printf '%s/%s\n' "$PKGS" "$1" ;;
+    esac
+}
+
+# id -> the name to show the user
+disp() {
+    case "$1" in
+        skp-*) printf 'skp/%s\n' "${1#skp-}" ;;
+        *)     printf '%s\n' "$1" ;;
+    esac
+}
+
+# typed name -> id, or die. callers use: id="$(resolve "$x")" || exit 1
+resolve() {
+    valid_port "$1" || die "invalid port name '$1' (expected class-name, eg. util-pfetch, or skp/class-name)"
+    port_id "$1"
+}
+
+# util-pfetch -> pfetch    skp-devel-mesa -> mesa
+primary_name() {
+    local n="${1#skp-}"
+    printf '%s\n' "${n#*-}"
+}
 
 # protected ports: the base class (init, bootloader, ...)
 is_protected() {
@@ -62,9 +117,20 @@ read_list() {
     sed 's/\r$//; s/#.*//; s/^[[:space:]]*//; s/[[:space:]]*$//' "$1" | grep -v '^$'
 }
 
-# multibin file: accepts .multibin (contribute.md) or .multbin (hdxi.md)
+# does installed port id $1 list id $2 in its deps?
+depends_on() {
+    local d
+    for d in $(read_list "$(port_dir "$1")/deps"); do
+        [ "$(port_id "$d")" = "$2" ] && return 0
+    done
+    return 1
+}
+
+# multibin file: accepts .multibin (contribute.md), .multbin (hdxi.md) or _multibin
 multibin_file() {
-    for f in "$PKGS/$1/.multibin" "$PKGS/$1/.multbin"; do
+    local d f
+    d="$(port_dir "$1")"
+    for f in "$d/.multibin" "$d/.multbin" "$d/_multibin"; do
         [ -f "$f" ] && { printf '%s\n' "$f"; return 0; }
     done
     return 1
@@ -103,13 +169,16 @@ is_busybox() {
 
 # ---------- install ----------
 
+# $1 is a port id (see port_id)
 install_pkg() {
-    local pkg="$1" dir deps d old_stack
+    local pkg="$1" dir deps d did old_stack
 
-    valid_name "$pkg" || die "invalid port name '$pkg' (expected class-name, eg. util-pfetch)"
-    dir="$PKGS/$pkg"
-    [ -d "$dir" ]          || die "no such port: $pkg (looked in $PKGS)"
-    [ -f "$dir/make.sh" ]  || die "port $pkg has no make.sh"
+    dir="$(port_dir "$pkg")"
+    case "$pkg" in
+        skp-*) [ -d "$SKP/pkgs" ] || die "no skunkport tree at $SKP. get it with: hdx skp" ;;
+    esac
+    [ -d "$dir" ]          || die "no such port: $(disp "$pkg") (looked in ${dir%/*})"
+    [ -f "$dir/make.sh" ]  || die "port $(disp "$pkg") has no make.sh"
 
     # cycle detection
     case " $STACK " in
@@ -118,25 +187,43 @@ install_pkg() {
     old_stack="$STACK"
     STACK="${STACK:+$STACK }$pkg"
 
+    # a port can ship a warning file (skunkports should): show it and ask
+    # before anything is built. no terminal means no, unless HDX_YES=1.
+    if [ -f "$dir/warning" ]; then
+        msg "warning for $(disp "$pkg"):"
+        sed 's/^/    /' "$dir/warning"
+        if [ "${HDX_YES:-0}" != "1" ]; then
+            confirm "build $(disp "$pkg") anyway?" || die "aborted"
+        fi
+    fi
+
     # dependencies first. collect into a variable before looping so that
     # nested make.sh scripts can never swallow the deps file from stdin.
     deps="$(read_list "$dir/deps")"
     for d in $deps; do
-        if have_dep "$d"; then
-            msg "dependency $d: ok"
+        did="$(resolve "$d")" || exit 1
+        # normal ports must never depend on skunkports
+        case "$pkg" in
+            skp-*) ;;
+            *) case "$did" in
+                   skp-*) die "$pkg depends on skunkport $d. normal ports must not depend on skunkports" ;;
+               esac ;;
+        esac
+        if have_dep "$did"; then
+            msg "dependency $(disp "$did"): ok"
         else
-            msg "dependency $d: building first"
-            install_pkg "$d"
+            msg "dependency $(disp "$did"): building first"
+            install_pkg "$did"
         fi
     done
 
-    msg "building $pkg"
+    msg "building $(disp "$pkg")"
     mkdir -p "$SRC" || die "cannot create $SRC"
     export HDXP HDX_PKG="$pkg" HDX_SRC="$SRC/$pkg-src"
 
     # -e: any failing command in make.sh aborts the build
     if ! ( cd "$dir" && sh -e ./make.sh ); then
-        die "build of $pkg failed. source left in $SRC/$pkg-src for debugging."
+        die "build of $(disp "$pkg") failed. source left in $SRC/$pkg-src for debugging."
     fi
 
     # flush to disk before marking it installed, so a crash or a killed vm
@@ -145,33 +232,35 @@ install_pkg() {
 
     # only mark as installed after a clean build
     mkdir -p "$STATE" || die "cannot create $STATE"
-    date > "$STATE/$pkg" || die "cannot write marker for $pkg"
+    date > "$STATE/$pkg" || die "cannot write marker for $(disp "$pkg")"
     sync
-    msg "installed $pkg"
+    msg "installed $(disp "$pkg")"
 
     STACK="$old_stack"
 }
 
 # entry point for "hdx i": skip targets that are already installed unless -f
 install_target() {
-    if is_installed "$1" && [ "$FORCE" -eq 0 ]; then
-        msg "$1 is already installed (use -f to rebuild)"
+    local id
+    id="$(resolve "$1")" || exit 1
+    if is_installed "$id" && [ "$FORCE" -eq 0 ]; then
+        msg "$(disp "$id") is already installed (use -f to rebuild)"
         return 0
     fi
-    install_pkg "$1"
+    install_pkg "$id"
 }
 
 # ---------- remove ----------
 
 remove_pkg() {
-    local pkg="$1" name names found dir f other script
+    local pkg name names found dir f other script
 
-    valid_name "$pkg" || die "invalid port name '$pkg'"
+    pkg="$(resolve "$1")" || exit 1
 
     if is_protected "$pkg" && [ "$FORCE" -eq 0 ]; then
         die "$pkg is a protected base port (init, bootloader, ...). removing it can make the system unbootable. use: hdx r -f $pkg"
     fi
-    is_installed "$pkg" || msg "note: $pkg has no install marker, searching anyway"
+    is_installed "$pkg" || msg "note: $(disp "$pkg") has no install marker, searching anyway"
 
     # warn if something else depends on this port
     if [ -d "$STATE" ]; then
@@ -179,13 +268,13 @@ remove_pkg() {
             [ -f "$f" ] || continue
             other="${f##*/}"
             [ "$other" = "$pkg" ] && continue
-            if read_list "$PKGS/$other/deps" | grep -qx "$pkg"; then
-                msg "warning: installed port $other depends on $pkg"
+            if depends_on "$other" "$pkg"; then
+                msg "warning: installed port $(disp "$other") depends on $(disp "$pkg")"
             fi
         done
     fi
 
-    # names to hunt for: primary name + anything in .multibin
+    # names to hunt for: primary name + anything in the multibin file
     names="$(primary_name "$pkg")"
     if f="$(multibin_file "$pkg")"; then
         names="$names $(read_list "$f")"
@@ -204,12 +293,12 @@ remove_pkg() {
     done
 
     # optional uninstall.sh: removes everything else the port installed
-    script="$PKGS/$pkg/uninstall.sh"
+    script="$(port_dir "$pkg")/uninstall.sh"
     [ -f "$script" ] || script=""
 
     if [ -z "$found" ] && [ -z "$script" ]; then
-        msg "no binaries found for $pkg (library port?)"
-        confirm "drop install marker for $pkg?" || { msg "aborted"; return 1; }
+        msg "no binaries found for $(disp "$pkg") (library port?)"
+        confirm "drop install marker for $(disp "$pkg")?" || { msg "aborted"; return 1; }
         rm -f "$STATE/$pkg"
         return 0
     fi
@@ -225,17 +314,17 @@ remove_pkg() {
     if is_protected "$pkg"; then
         msg "WARNING: $pkg is a base port. this may leave the system unbootable."
     fi
-    confirm "remove $pkg?" || { msg "aborted"; return 1; }
+    confirm "remove $(disp "$pkg")?" || { msg "aborted"; return 1; }
 
     # script first: if it fails, nothing else has been touched yet
     if [ -n "$script" ]; then
-        if ! ( cd "$PKGS/$pkg" && as_root env HDXP="$HDXP" HDX_PKG="$pkg" sh -e ./uninstall.sh ); then
-            die "uninstall script for $pkg failed. binaries were not removed and $pkg is still marked installed."
+        if ! ( cd "$(port_dir "$pkg")" && as_root env HDXP="$HDXP" HDX_PKG="$pkg" sh -e ./uninstall.sh ); then
+            die "uninstall script for $(disp "$pkg") failed. binaries were not removed and $(disp "$pkg") is still marked installed."
         fi
     fi
     for f in $found; do as_root rm -f -- "$f"; done
     rm -f "$STATE/$pkg"
-    msg "removed $pkg"
+    msg "removed $(disp "$pkg")"
 }
 
 # ---------- update ----------
@@ -256,7 +345,7 @@ restore_markers() {
     done
 }
 
-update_tree() {
+update_main_tree() {
     local old new changed p hit
 
     command -v git >/dev/null 2>&1 || die "git not found, cannot update the ports tree"
@@ -300,23 +389,73 @@ update_tree() {
     fi
 }
 
+# the skunkport tree is separate and optional. "hdx skp" clones it the first
+# time; after that it is cloned, so "hdx u" keeps it up to date too.
+skp_tree() {
+    local old new changed p hit
+
+    command -v git >/dev/null 2>&1 || die "git not found, cannot update the skunkport tree"
+
+    if [ ! -d "$SKP/.git" ]; then
+        if [ -e "$SKP" ] && [ -n "$(ls -A "$SKP" 2>/dev/null)" ]; then
+            die "$SKP exists but is not a git clone. move it aside, then run hdx skp again"
+        fi
+        [ -d "$HDXP" ] || die "no ports tree at $HDXP. run hdx u first"
+        msg "cloning the skunkport tree from $SKP_URL"
+        git clone "$SKP_URL" "$SKP" || die "clone failed"
+        sync
+        msg "skunkport tree ready. skunkports are unsupported and can take very long to build."
+        return 0
+    fi
+
+    old="$(git -C "$SKP" rev-parse HEAD 2>/dev/null)" || die "$SKP is a broken git clone"
+    msg "updating skunkport tree"
+    git -C "$SKP" pull --ff-only \
+        || die "update failed. local changes or diverged history in $SKP? (see: git -C $SKP status)"
+    new="$(git -C "$SKP" rev-parse HEAD)"
+
+    if [ "$old" = "$new" ]; then
+        msg "skunkport tree is already up to date"
+        return 0
+    fi
+
+    changed="$(git -C "$SKP" diff --name-only "$old" "$new" -- pkgs | cut -d/ -f2 | sort -u)"
+    hit=""
+    for p in $changed; do
+        is_installed "skp-$p" && hit="$hit skp/$p"
+    done
+    sync
+    msg "skunkport tree updated"
+    if [ -n "$hit" ]; then
+        msg "installed skunkports with changes (rebuild with: hdx i -f <port>):"
+        for p in $hit; do printf '  %s\n' "$p"; done
+    fi
+}
+
+update_tree() {
+    update_main_tree
+    if [ -d "$SKP/.git" ]; then skp_tree; fi
+    return 0
+}
+
 # ---------- misc ----------
 
 list_pkgs() {
     [ -d "$STATE" ] || return 0
     for f in "$STATE"/*; do
-        [ -f "$f" ] && printf '%s\n' "${f##*/}"
+        [ -f "$f" ] && disp "${f##*/}"
     done
 }
 
 show_info() {
-    local pkg="$1" f shown=0
-    valid_name "$pkg" || die "invalid port name '$pkg'"
-    [ -d "$PKGS/$pkg" ] || die "no such port: $pkg"
-    for f in "$PKGS/$pkg"/info*; do
+    local pkg dir f shown=0
+    pkg="$(resolve "$1")" || exit 1
+    dir="$(port_dir "$pkg")"
+    [ -d "$dir" ] || die "no such port: $(disp "$pkg")"
+    for f in "$dir"/info*; do
         [ -f "$f" ] && { cat "$f"; shown=1; }
     done
-    [ "$shown" -eq 1 ] || msg "$pkg has no info file"
+    [ "$shown" -eq 1 ] || msg "$(disp "$pkg") has no info file"
 }
 
 usage() {
@@ -333,9 +472,14 @@ hdx - high definition execution
                            clones it first if it is missing
   hdx u i [-f] <class-pkg> update the tree, then install
                            (shorthand: hdx ui [-f] <class-pkg>)
+  hdx skp                  clone the skunkport tree (or update it)
   hdx help                 this text
 
-ports tree: $PKGS
+skunkports are heavy, experimental, unsupported ports. use the skp/ prefix:
+  hdx i skp/<class-pkg>
+
+ports tree:      $PKGS
+skunkport tree:  $SKP/pkgs
 USAGE
 }
 
@@ -370,6 +514,7 @@ case "$cmd" in
     ui)        [ $# -ge 1 ] || die "usage: hdx ui [-f] <class-pkg>"
                update_tree
                for p in "$@"; do install_target "$p"; done ;;
+    skp)       skp_tree ;;
     l|list)    list_pkgs ;;
     info)      [ $# -ge 1 ] || die "usage: hdx info <class-pkg>"
                show_info "$1" ;;
