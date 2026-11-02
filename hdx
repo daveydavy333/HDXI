@@ -78,10 +78,15 @@ port_id() {
     esac
 }
 
+# where the skunkport ports sit: the repo root, or a pkgs/ folder if it has one
+skp_root() {
+    if [ -d "$SKP/pkgs" ]; then printf '%s/pkgs\n' "$SKP"; else printf '%s\n' "$SKP"; fi
+}
+
 # id -> directory of the port
 port_dir() {
     case "$1" in
-        skp-*) printf '%s/pkgs/%s\n' "$SKP" "${1#skp-}" ;;
+        skp-*) printf '%s/%s\n' "$(skp_root)" "${1#skp-}" ;;
         *)     printf '%s/%s\n' "$PKGS" "$1" ;;
     esac
 }
@@ -175,7 +180,7 @@ install_pkg() {
 
     dir="$(port_dir "$pkg")"
     case "$pkg" in
-        skp-*) [ -d "$SKP/pkgs" ] || die "no skunkport tree at $SKP. get it with: hdx skp" ;;
+        skp-*) [ -d "$SKP/.git" ] || die "no skunkport tree at $SKP. get it with: hdx skp" ;;
     esac
     [ -d "$dir" ]          || die "no such port: $(disp "$pkg") (looked in ${dir%/*})"
     [ -f "$dir/make.sh" ]  || die "port $(disp "$pkg") has no make.sh"
@@ -419,7 +424,7 @@ skp_tree() {
         return 0
     fi
 
-    changed="$(git -C "$SKP" diff --name-only "$old" "$new" -- pkgs | cut -d/ -f2 | sort -u)"
+    changed="$(git -C "$SKP" diff --name-only "$old" "$new" | sed 's|^pkgs/||' | cut -d/ -f1 | sort -u)"
     hit=""
     for p in $changed; do
         is_installed "skp-$p" && hit="$hit skp/$p"
@@ -479,7 +484,7 @@ skunkports are heavy, experimental, unsupported ports. use the skp/ prefix:
   hdx i skp/<class-pkg>
 
 ports tree:      $PKGS
-skunkport tree:  $SKP/pkgs
+skunkport tree:  $(skp_root)
 USAGE
 }
 
