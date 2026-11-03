@@ -3,7 +3,8 @@
 # the HDXP port manager for HDXI.
 #
 # usage:
-#   hdx i [-f] <class-pkg>   install a port (and its deps, recursively)
+#   hdx i [-f] [-y] <class-pkg>...  install ports (and their deps, recursively).
+#                            shows what will be installed and asks before building
 #   hdx r [-f] <class-pkg>   remove a port (its binaries, plus its uninstall.sh if it has one)
 #   hdx l                    list installed ports
 #   hdx info <class-pkg>     show a port's info file
@@ -15,9 +16,10 @@
 # skunkports: extremely heavy or experimental ports live in a separate tree
 # (hdxp-skp, cloned to /hdxp/skp). use the skp/ prefix with any command:
 #   hdx i skp/devel-mesa
-# a port with a "warning" file shows it and asks before building.
+# a port with a "warning" file has it shown in the install plan before you confirm.
 #
 # -f on install: rebuild even if the port is already installed.
+# -y on install: do not ask for confirmation (same as HDX_YES=1).
 # -f on remove:  allow removing protected ports (class base-).
 #
 # env:
@@ -29,7 +31,7 @@
 #                (default /usr/share/hdxi/installed)
 #   HDX_SKP      root of the skunkport tree (default $HDXP/skp)
 #   SKP_URL      git url of the skunkport tree (default the official hdxp-skp repo)
-#   HDX_YES      set to 1 to skip the "build anyway?" question for ports with a warning
+#   HDX_YES      set to 1 to skip the install confirmation (same as -y)
 
 HDXP="${HDXP:-/hdxp}"
 PKGS="$HDXP/pkgs"
@@ -174,9 +176,25 @@ is_busybox() {
 
 # ---------- install ----------
 
-# $1 is a port id (see port_id)
-install_pkg() {
+PLAN=""   # ports to build, in dependency order (ids)
+SAT=""    # dependencies that are already satisfied (ids), for the summary
+YES="${HDX_YES:-0}"
+
+# consume a leading -f / -y flag. use: while [ $# -gt 0 ] && flag_arg "$1"; do shift; done
+flag_arg() {
+    case "$1" in
+        -f) FORCE=1 ;;
+        -y) YES=1 ;;
+        *)  return 1 ;;
+    esac
+}
+
+# work out what installing port id $1 needs, without building anything.
+# dependencies land in PLAN before the port itself.
+plan_add() {
     local pkg="$1" dir deps d did old_stack
+
+    case " $PLAN " in *" $pkg "*) return 0 ;; esac
 
     dir="$(port_dir "$pkg")"
     case "$pkg" in
@@ -192,18 +210,7 @@ install_pkg() {
     old_stack="$STACK"
     STACK="${STACK:+$STACK }$pkg"
 
-    # a port can ship a warning file (skunkports should): show it and ask
-    # before anything is built. no terminal means no, unless HDX_YES=1.
-    if [ -f "$dir/warning" ]; then
-        msg "warning for $(disp "$pkg"):"
-        sed 's/^/    /' "$dir/warning"
-        if [ "${HDX_YES:-0}" != "1" ]; then
-            confirm "build $(disp "$pkg") anyway?" || die "aborted"
-        fi
-    fi
-
-    # dependencies first. collect into a variable before looping so that
-    # nested make.sh scripts can never swallow the deps file from stdin.
+    # collect into a variable before looping so nothing can swallow the deps file from stdin
     deps="$(read_list "$dir/deps")"
     for d in $deps; do
         did="$(resolve "$d")" || exit 1
@@ -215,12 +222,44 @@ install_pkg() {
                esac ;;
         esac
         if have_dep "$did"; then
-            msg "dependency $(disp "$did"): ok"
+            case " $SAT " in *" $did "*) ;; *) SAT="${SAT:+$SAT }$did" ;; esac
         else
-            msg "dependency $(disp "$did"): building first"
-            install_pkg "$did"
+            plan_add "$did"
         fi
     done
+
+    PLAN="${PLAN:+$PLAN }$pkg"
+    STACK="$old_stack"
+}
+
+# print the plan: what will be built, what is already there, and any warnings
+show_plan() {
+    local p n=0 tag list=""
+    msg "the following ports will be installed:"
+    for p in $PLAN; do
+        n=$((n + 1))
+        tag=""
+        case "$p" in skp-*) tag=" (skunkport)" ;; esac
+        is_installed "$p" && tag="$tag (rebuild)"
+        printf '  %s%s\n' "$(disp "$p")" "$tag"
+    done
+    msg "$n port(s) in total"
+    if [ -n "$SAT" ]; then
+        for p in $SAT; do list="${list:+$list, }$(disp "$p")"; done
+        msg "already satisfied: $list"
+    fi
+    for p in $PLAN; do
+        if [ -f "$(port_dir "$p")/warning" ]; then
+            msg "warning for $(disp "$p"):"
+            sed 's/^/    /' "$(port_dir "$p")/warning"
+        fi
+    done
+}
+
+# build one port from the plan (its dependencies were built before it)
+build_pkg() {
+    local pkg="$1" dir
+    dir="$(port_dir "$pkg")"
 
     msg "building $(disp "$pkg")"
     mkdir -p "$SRC" || die "cannot create $SRC"
@@ -240,19 +279,32 @@ install_pkg() {
     date > "$STATE/$pkg" || die "cannot write marker for $(disp "$pkg")"
     sync
     msg "installed $(disp "$pkg")"
-
-    STACK="$old_stack"
 }
 
-# entry point for "hdx i": skip targets that are already installed unless -f
-install_target() {
-    local id
-    id="$(resolve "$1")" || exit 1
-    if is_installed "$id" && [ "$FORCE" -eq 0 ]; then
-        msg "$(disp "$id") is already installed (use -f to rebuild)"
-        return 0
+# entry point for "hdx i": plan everything, show it, ask once, then build.
+# -f rebuilds targets that are already installed. -y (or HDX_YES=1) skips the question.
+install_targets() {
+    local p id
+    PLAN=""; SAT=""; STACK=""
+
+    for p in "$@"; do
+        id="$(resolve "$p")" || exit 1
+        if is_installed "$id" && [ "$FORCE" -eq 0 ]; then
+            msg "$(disp "$id") is already installed (use -f to rebuild)"
+            continue
+        fi
+        plan_add "$id"
+    done
+
+    [ -n "$PLAN" ] || return 0
+    show_plan
+
+    # no terminal means no, unless -y was given
+    if [ "$YES" != "1" ]; then
+        confirm "proceed?" || { msg "aborted"; exit 1; }
     fi
-    install_pkg "$id"
+
+    for p in $PLAN; do build_pkg "$p"; done
 }
 
 # ---------- remove ----------
@@ -467,16 +519,19 @@ usage() {
     cat <<USAGE
 hdx - high definition execution
 
-  hdx i [-f] <class-pkg>   install a port and its dependencies
-                           (-f: rebuild if already installed)
+  hdx i [-f] [-y] <class-pkg>...
+                           install ports and their dependencies. lists what
+                           will be installed and asks first
+                           (-f: rebuild if already installed, -y: do not ask)
   hdx r [-f] <class-pkg>   remove a port
                            (-f: allow removing protected base- ports)
   hdx l                    list installed ports
   hdx info <class-pkg>     show port info
   hdx u                    update the ports tree (git pull);
                            clones it first if it is missing
-  hdx u i [-f] <class-pkg> update the tree, then install
-                           (shorthand: hdx ui [-f] <class-pkg>)
+  hdx u i [-f] [-y] <class-pkg>
+                           update the tree, then install
+                           (shorthand: hdx ui [-f] [-y] <class-pkg>)
   hdx skp                  clone the skunkport tree (or update it)
   hdx help                 this text
 
@@ -494,14 +549,11 @@ cmd="$1"
 [ $# -gt 0 ] && shift
 
 # optional -f flag after the command
-if [ "$1" = "-f" ]; then
-    FORCE=1
-    shift
-fi
+while [ $# -gt 0 ] && flag_arg "$1"; do shift; done
 
 case "$cmd" in
-    i|install) [ $# -ge 1 ] || die "usage: hdx i [-f] <class-pkg>"
-               for p in "$@"; do install_target "$p"; done ;;
+    i|install) [ $# -ge 1 ] || die "usage: hdx i [-f] [-y] <class-pkg>..."
+               install_targets "$@" ;;
     r|remove)  [ $# -ge 1 ] || die "usage: hdx r [-f] <class-pkg>"
                for p in "$@"; do remove_pkg "$p"; done ;;
     u|update)  if [ $# -gt 0 ]; then
@@ -509,16 +561,16 @@ case "$cmd" in
                        i|install) shift ;;
                        *) die "usage: hdx u [i [-f] <class-pkg>]" ;;
                    esac
-                   if [ "$1" = "-f" ]; then FORCE=1; shift; fi
-                   [ $# -ge 1 ] || die "usage: hdx u i [-f] <class-pkg>"
+                   while [ $# -gt 0 ] && flag_arg "$1"; do shift; done
+                   [ $# -ge 1 ] || die "usage: hdx u i [-f] [-y] <class-pkg>"
                    update_tree
-                   for p in "$@"; do install_target "$p"; done
+                   install_targets "$@"
                else
                    update_tree
                fi ;;
-    ui)        [ $# -ge 1 ] || die "usage: hdx ui [-f] <class-pkg>"
+    ui)        [ $# -ge 1 ] || die "usage: hdx ui [-f] [-y] <class-pkg>"
                update_tree
-               for p in "$@"; do install_target "$p"; done ;;
+               install_targets "$@" ;;
     skp)       skp_tree ;;
     l|list)    list_pkgs ;;
     info)      [ $# -ge 1 ] || die "usage: hdx info <class-pkg>"
