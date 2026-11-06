@@ -9,7 +9,7 @@ this procedure has so far been tested in qemu with UEFI firmware only. real hard
 ## what you need
 
 * any linux live system (or the HDXI installation media) with: tar, a GPT-capable partitioning tool (sfdisk, sgdisk, parted, cfdisk, or gparted), mkfs.vfat, mkfs.ext4, blkid, and chroot. live systems differ, so check what yours has: `command -v sfdisk sgdisk parted cfdisk`.
-* a UEFI machine. legacy BIOS is not supported by `base-limine` yet.
+* a UEFI machine. legacy BIOS is not supported yet, by neither `base-limine` nor `base-grub`.
 * secure boot turned off. the bootloader is built from source and is not signed.
 * an internet connection. hdx downloads sources, and the kernel source is about 150 MB.
 * patience. building the kernel takes a while.
@@ -101,9 +101,12 @@ if you want to change the kernel configuration, see the info file: `hdx info bas
 
 ! the EFI system partition must be mounted at /boot first (step 2).
 
-    hdx i base-limine
+pick one. limine is the default, grub is the alternative:
 
-this builds limine for UEFI and puts it at /boot/EFI/BOOT/BOOTX64.EFI.
+    hdx i base-limine         # limine (config: /boot/limine.conf)
+    hdx i base-grub           # grub (config: /boot/grub/grub.cfg)
+
+both build for UEFI and put themselves at /boot/EFI/BOOT/BOOTX64.EFI, so only one of them can be active at a time. installing the second one replaces the first one's EFI file (the old file is kept as BOOTX64.EFI.old).
 
 ## 6 write the bootloader config
 
@@ -118,7 +121,7 @@ then set INIT to your init's binary: `INIT=/sbin/runit-init` for runit, or `INIT
 
     INIT=/sbin/runit-init
 
-if that prints nothing, `sgdisk -i 2 /dev/sdX` shows the same id as "Partition unique GUID", and you can set PARTUUID= to it by copy and paste. then write the config:
+if that prints nothing, `sgdisk -i 2 /dev/sdX` shows the same id as "Partition unique GUID", and you can set PARTUUID= to it by copy and paste. then write the config for the bootloader you installed. with limine:
 
     printf 'timeout: 3\n\n/HDXI\n    protocol: linux\n    path: boot():/vmlinuz\n    cmdline: root=PARTUUID=%s rootwait rw init=%s console=tty0\n' "$PARTUUID" "$INIT" > /mnt/boot/limine.conf
     cat /mnt/boot/limine.conf
@@ -132,7 +135,21 @@ the file should read:
         path: boot():/vmlinuz
         cmdline: root=PARTUUID=YOUR-PARTUUID rootwait rw init=/sbin/runit-init console=tty0
 
-if the boot panics with an empty root device name, the root= option did not reach the kernel: check the cmdline line for typos. at limine's menu you can press `e` on the entry to see and edit it for one boot.
+with grub, the config is /boot/grub/grub.cfg instead:
+
+    mkdir -p /mnt/boot/grub
+    printf 'set timeout=3\n\nmenuentry "HDXI" {\n    linux /vmlinuz root=PARTUUID=%s rootwait rw init=%s console=tty0\n}\n' "$PARTUUID" "$INIT" > /mnt/boot/grub/grub.cfg
+    cat /mnt/boot/grub/grub.cfg
+
+the file should read:
+
+    set timeout=3
+
+    menuentry "HDXI" {
+        linux /vmlinuz root=PARTUUID=YOUR-PARTUUID rootwait rw init=/sbin/runit-init console=tty0
+    }
+
+if the boot panics with an empty root device name, the root= option did not reach the kernel: check the cmdline line for typos. at the boot menu you can press `e` on the entry to see and edit it for one boot.
 
 `rootwait` makes the kernel wait for the root disk to appear. real hardware (usb sticks, emmc, some sata controllers) brings its disks up after the kernel starts looking for root, and without rootwait the boot panics. there is no initramfs to wait for you. virtual machines do not need it, but it does no harm.
 
@@ -140,10 +157,10 @@ about the console= options: `console=tty0` sends kernel messages to the screen. 
 
 before you reboot, check that everything is where limine expects it:
 
-    ls /boot                 # limine.conf, vmlinuz, EFI
+    ls /boot                 # limine.conf (or grub/), vmlinuz, EFI
     ls /boot/EFI/BOOT        # BOOTX64.EFI
-    cat /boot/limine.conf    # the PARTUUID must match: blkid /dev/sdX2
-    hdx l                    # your init, base-kernel and base-limine should be listed
+    cat /boot/limine.conf    # or /boot/grub/grub.cfg: the PARTUUID must match: blkid /dev/sdX2
+    hdx l                    # your init, base-kernel and your bootloader should be listed
 
 ## installation should be finished at this point.
 
