@@ -106,13 +106,13 @@ pick one. limine is the default, grub is the alternative:
     hdx i base-limine         # limine (config: /boot/limine.conf)
     hdx i base-grub           # grub (config: /boot/grub/grub.cfg)
 
-both build for UEFI and put themselves at /boot/EFI/BOOT/BOOTX64.EFI, so only one of them can be active at a time. installing the second one replaces the first one's EFI file (the old file is kept as BOOTX64.EFI.old).
+both build for UEFI and put themselves at /boot/EFI/BOOT/BOOTX64.EFI, so only one of them can be active at a time. installing the second one replaces the first one's EFI file (the file that was there first is kept as BOOTX64.EFI.old).
 
 ## 6 write the bootloader config
 
-limine needs to know which kernel to start and where the root partition is. the root partition is identified by its PARTUUID, a 36 character id. do not type it by hand. one wrong character gives a kernel panic that says almost nothing: `Cannot open root device ""` with an empty name, and an empty list of partitions. let the shell fill it in.
+the bootloader needs to know which kernel to start and where the root partition is. the root partition is identified by its PARTUUID, a 36 character id. do not type it by hand. one wrong character gives a kernel panic that says almost nothing: `Cannot open root device ""` with an empty name, and an empty list of partitions. let the shell fill it in.
 
-from the live system (outside the chroot, with the root partition mounted at /mnt and the ESP at /mnt/boot):
+from the live system (outside the chroot, with the root partition mounted at /mnt and the ESP at /mnt/boot). this needs the blkid from util-linux, which most live systems have. busybox's blkid, including the one on an installed hdxi, ignores `-s` and `-o` and does not show PARTUUIDs at all, so do not try this inside hdxi.
 
     PARTUUID=$(blkid -s PARTUUID -o value /dev/sdX2)
     echo "$PARTUUID"
@@ -149,13 +149,15 @@ the file should read:
         linux /vmlinuz root=PARTUUID=YOUR-PARTUUID rootwait rw init=/sbin/runit-init console=tty0
     }
 
+the closing } matters. without it grub never finishes reading the menu entry and drops you at a `grub>` prompt instead of showing the menu. if that happens, you can still boot once by hand: type the `linux` line from the file at the prompt, then `boot`, and fix grub.cfg after logging in.
+
 if the boot panics with an empty root device name, the root= option did not reach the kernel: check the cmdline line for typos. at the boot menu you can press `e` on the entry to see and edit it for one boot.
 
 `rootwait` makes the kernel wait for the root disk to appear. real hardware (usb sticks, emmc, some sata controllers) brings its disks up after the kernel starts looking for root, and without rootwait the boot panics. there is no initramfs to wait for you. virtual machines do not need it, but it does no harm.
 
 about the console= options: `console=tty0` sends kernel messages to the screen. `console=ttyS0` sends them to a serial port, which is handy in a virtual machine. you can give both, and the last one listed becomes the main console. either way, you get a login prompt on the screen, because the init starts a getty on tty1.
 
-before you reboot, check that everything is where limine expects it:
+before you reboot, check that everything is where your bootloader expects it:
 
     ls /boot                 # limine.conf (or grub/), vmlinuz, EFI
     ls /boot/EFI/BOOT        # BOOTX64.EFI
