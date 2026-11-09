@@ -6,6 +6,8 @@ the tarball contains a base system: musl, busybox, a build toolchain, hdx and th
 
 this procedure has so far been tested in qemu with UEFI firmware only. real hardware may need adjustments.
 
+**IF DOING ON BARE METAL: THIS DOES NOT COVER CONFIGURING YOUR KERNEL. PLEASE DO SO YOURSELF.**
+
 ## what you need
 
 * any linux live system (or the HDXI installation media) with: tar, a GPT-capable partitioning tool (sfdisk, sgdisk, parted, cfdisk, or gparted), mkfs.vfat, mkfs.ext4, blkid, and chroot. live systems differ, so check what yours has: `command -v sfdisk sgdisk parted cfdisk`.
